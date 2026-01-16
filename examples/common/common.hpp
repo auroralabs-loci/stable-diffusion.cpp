@@ -467,6 +467,7 @@ struct SDContextParams {
     std::string control_net_backend_device;
     std::string upscaler_backend_device;
     std::string photomaker_backend_device;
+    std::string vision_backend_device;
 
     std::map<std::string, std::string> embedding_map;
     std::vector<sd_embedding_t> embedding_vec;
@@ -611,7 +612,10 @@ struct SDContextParams {
              "--photomaker-backend-device",
              "device to use for photomaker (defaults to main-backend-device)",
              &photomaker_backend_device},
-
+             {"",
+             "--vision-backend-device",
+             "device to use for clip-vision model (defaults to clip-backend-device)",
+             &vision_backend_device},
 
         };
 
@@ -1025,6 +1029,7 @@ struct SDContextParams {
             tae_backend_device.c_str(),
             control_net_backend_device.c_str(),
             photomaker_backend_device.c_str(),
+            vision_backend_device.c_str(),
         };
         return sd_ctx_params;
     }
