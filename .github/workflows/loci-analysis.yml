@@ -1,0 +1,67 @@
+name: LOCI Analysis
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [ master ]
+
+env:
+  LOCI_PROJECT: stable-diffusion.cpp
+  LOCI_API_KEY: '${{ secrets.LOCI_API_KEY }}'
+  LOCI_BACKEND_URL: '${{ vars.LOCI_BACKEND_URL }}'
+
+jobs:
+  build-and-upload:
+    name: Build and Upload Artifacts
+    runs-on: ubuntu-latest
+    environment: ${{ vars.LOCI_ENV || 'stable-diffusion-cpp-prod' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+
+      - name: Install dependencies (including curl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            libcurl4-openssl-dev
+     
+      - name: Create build directory and configure with CMake
+        run: |
+          mkdir build
+          cd build
+          cmake .. \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS_DEBUG="-g -gdwarf-4 -O0 -fno-omit-frame-pointer" \
+            -DCMAKE_C_FLAGS_DEBUG="-g -gdwarf-4 -O0 -fno-omit-frame-pointer" \
+            -DCMAKE_C_FLAGS="-march=armv8-a -Wl,-Bsymbolic" \
+            -DCMAKE_CXX_FLAGS="-march=armv8-a -Wl,-Bsymbolic"
+
+
+      - name: Build project
+        run: |
+          cd build
+          cmake --build . -j4
+
+      - name: Upload build artifacts
+        uses: auroralabs-loci/loci-action@v1
+        with:
+          mode: upload
+          binaries: |
+                build/bin/sd-cli
+                build/bin/sd-server
+          project:  ${{ env.LOCI_PROJECT }}
+          wait-base: 'true'
