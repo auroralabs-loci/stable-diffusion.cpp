@@ -614,7 +614,7 @@ struct SDContextParams {
              &photomaker_backend_device},
              {"",
              "--vision-backend-device",
-             "device to use for clip-vision model (defaults to clip-backend-device)",
+             "device to use for clip-vision model (defaults to main-backend-device)",
              &vision_backend_device},
 
         };
