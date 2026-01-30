@@ -1577,7 +1577,7 @@ struct WeightAdapter {
             bool force_prec_f32 = false;
             float scale         = 1.f;
         } linear;
-        struct {
+        struct conv2d_params_t{
             int s0          = 1;
             int s1          = 1;
             int p0          = 0;
@@ -2629,5 +2629,104 @@ public:
         return x;
     }
 };
+
+__STATIC_INLINE__ struct ggml_tensor* ggml_ext_lokr_forward(
+    struct ggml_context* ctx,
+    struct ggml_tensor* h,    // Input: [q, batch] or [W, H, q, batch]
+    struct ggml_tensor* w1,   // Outer C (Full rank)
+    struct ggml_tensor* w1a,  // Outer A (Low rank part 1)
+    struct ggml_tensor* w1b,  // Outer B (Low rank part 2)
+    struct ggml_tensor* w2,   // Inner BA (Full rank)
+    struct ggml_tensor* w2a,  // Inner A (Low rank part 1)
+    struct ggml_tensor* w2b,  // Inner B (Low rank part 2)
+    bool is_conv,
+    WeightAdapter::ForwardParams::conv2d_params_t conv_params,
+    float scale) {
+
+    GGML_ASSERT((w1 != NULL || (w1a != NULL && w1b != NULL)));
+    GGML_ASSERT((w2 != NULL || (w2a != NULL && w2b != NULL)));
+
+    int uq = (w1 != NULL) ? (int)w1->ne[0] : (int)w1a->ne[0];
+    int up = (w1 != NULL) ? (int)w1->ne[1] : (int)w1b->ne[1];
+
+    int q_actual = is_conv ? (int)h->ne[2] : (int)h->ne[0];
+    int vq       = q_actual / uq;
+
+    int vp = (w2 != NULL) ? (is_conv ? (int)w2->ne[3] : (int)w2->ne[1])
+                          : (int)w2a->ne[1];
+    GGML_ASSERT(q_actual == (uq * vq) && "Input dimension mismatch for LoKR split");
+
+    struct ggml_tensor* hb;
+
+    if (!is_conv) {
+        int batch                 = (int)h->ne[1];
+        struct ggml_tensor* h_mat = ggml_reshape_2d(ctx, h, vq, uq * batch);
+
+        if (w2 != NULL) {
+            hb = ggml_mul_mat(ctx, w2, h_mat);
+        } else {
+            hb = ggml_mul_mat(ctx, w2b, ggml_mul_mat(ctx, w2a, h_mat));
+        }
+
+        struct ggml_tensor* hb_unbundled = ggml_reshape_3d(ctx, hb, vp, uq, batch);
+        struct ggml_tensor* hb_t         = ggml_transpose(ctx, hb_unbundled);
+
+        struct ggml_tensor* hc;
+        if (w1 != NULL) {
+            hc = ggml_mul_mat(ctx, w1, hb_t);
+        } else {
+            hc = ggml_mul_mat(ctx, w1b, ggml_mul_mat(ctx, w1a, hb_t));
+        }
+
+        struct ggml_tensor* hc_t = ggml_transpose(ctx, hc);
+        struct ggml_tensor* out  = ggml_reshape_2d(ctx, ggml_cont(ctx, hc_t), up * vp, batch);
+        return ggml_scale(ctx, out, scale);
+
+    } else {
+        int batch = (int)h->ne[3];
+
+        // Reshape input: [W, H, vq*uq, batch] -> [W, H, vq, uq * batch]
+        struct ggml_tensor* h_grouped = ggml_reshape_4d(ctx, h, h->ne[0], h->ne[1], vq, uq * batch);
+
+        if (w2 != NULL) {
+            hb = ggml_conv_2d(ctx, w2, h_grouped, conv_params.s0, conv_params.s1,
+                              conv_params.p0, conv_params.p1, conv_params.d0, conv_params.d1);
+        } else {
+            // Low-rank decomposition: w2b is the spatial kernel, w2a is the 1x1 projection
+            // Inner LoRA: w2b is the spatial/down-project, w2a is the 1x1 up-project
+            int rank = (int)w2b->ne[1];
+            int k    = (int)sqrt(w2b->ne[0] / vq);
+
+            struct ggml_tensor* w2b_4d = (ggml_n_dims(w2b) < 3) ? ggml_reshape_4d(ctx, w2b, k, k, vq, rank) : w2b;
+            struct ggml_tensor* w2a_4d = (ggml_n_dims(w2a) < 3) ? ggml_reshape_4d(ctx, w2a, 1, 1, rank, vp) : w2a;
+
+            struct ggml_tensor* ha = ggml_conv_2d(ctx, w2b_4d, h_grouped, conv_params.s0, conv_params.s1,
+                                                  conv_params.p0, conv_params.p1, conv_params.d0, conv_params.d1);
+            hb                     = ggml_conv_2d(ctx, w2a_4d, ha, 1, 1, 0, 0, 1, 1);
+        }
+
+        int w_out = (int)hb->ne[0];
+        int h_out = (int)hb->ne[1];
+
+        struct ggml_tensor* hb_flat = ggml_reshape_3d(ctx, hb, w_out * h_out * vp, uq, batch);
+        struct ggml_tensor* hb_t    = ggml_transpose(ctx, hb_flat);  
+
+        struct ggml_tensor* hc;
+        struct ggml_tensor* w1_mat = (w1 != NULL) ? ggml_reshape_2d(ctx, w1, uq, up) : NULL;
+
+        if (w1_mat != NULL) {
+            hc = ggml_mul_mat(ctx, w1_mat, hb_t); 
+        } else {
+            hc = ggml_mul_mat(ctx, w1b, ggml_mul_mat(ctx, w1a, hb_t));
+        }
+
+        struct ggml_tensor* hc_t = ggml_transpose(ctx, hc);
+        struct ggml_tensor* hc_res = ggml_reshape_4d(ctx, ggml_cont(ctx, hc_t), vp, w_out * h_out, up, batch);
+        struct ggml_tensor* hc_perm = ggml_permute(ctx, hc_res, 1, 2, 0, 3);
+        struct ggml_tensor* out = ggml_reshape_4d(ctx, ggml_cont(ctx, hc_perm), w_out, h_out, up * vp, batch);
+
+        return ggml_scale(ctx, out, scale);
+    }
+}
 
 #endif  // __GGML_EXTEND__HPP__
