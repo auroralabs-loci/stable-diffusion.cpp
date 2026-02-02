@@ -1,29 +1,50 @@
 name: LOCI Analysis
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - loci/main-*
   pull_request:
     types: [opened, synchronize, reopened]
-  push:
-    branches: [ master ]
-
-env:
-  LOCI_PROJECT: stable-diffusion.cpp
-  LOCI_API_KEY: '${{ secrets.LOCI_API_KEY }}'
-  LOCI_BACKEND_URL: '${{ vars.LOCI_BACKEND_URL }}'
 
 jobs:
-  build-and-upload:
-    name: Build and Upload Artifacts
+  loci:
+    if: vars.UPSTREAM_REPO != ''
     runs-on: ubuntu-latest
+
+    env:
+      LOCI_PROJECT: 'stable-diffusion.cpp'
+      LOCI_API_KEY: '${{ secrets.LOCI_API_KEY }}'
+      LOCI_BACKEND_URL: '${{ vars.LOCI_BACKEND_URL }}'
+      GH_TOKEN: ${{ secrets.MIRROR_REPOS_WRITE_PAT }}
+
     environment: ${{ vars.LOCI_ENV || 'stable-diffusion-cpp-prod' }}
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
+          ref: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.sha) || github.sha }}
 
+      - name: Compute target
+        id: target
+        if: github.event_name == 'push'
+        run: |
+          branch="${{ github.ref_name }}"
+          sha="${branch#loci/main-}"
+          echo "value=main@${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute base
+        id: base
+        if: github.event_name == 'pull_request'
+        run: |
+          git remote add upstream "https://github.com/${{ vars.UPSTREAM_REPO }}.git" 2>/dev/null || true   
+          git fetch upstream                                                                               
+          upstream_default=$(gh api "repos/${{ vars.UPSTREAM_REPO }}" --jq .default_branch)                
+          merge_base=$(git merge-base HEAD "upstream/${upstream_default}")                                 
+          short_sha="${merge_base:0:7}"                                                                    
+          echo "value=main@${short_sha}" >> "$GITHUB_OUTPUT"                                               
 
       - name: Install dependencies (including curl)
         run: |
@@ -64,4 +85,5 @@ jobs:
                 build/bin/sd-cli
                 build/bin/sd-server
           project:  ${{ env.LOCI_PROJECT }}
-          wait-base: 'true'
+          target: ${{ steps.target.outputs.value || ''}}
+          base: ${{ steps.base.outputs.value || '' }}
