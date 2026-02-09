@@ -89,6 +89,8 @@ std::vector<uint8_t> base64_decode(const std::string& encoded_string) {
 struct SDSvrParams {
     std::string listen_ip = "127.0.0.1";
     int listen_port       = 1234;
+    int default_width      = 512;
+    int default_height     = 512;
     std::string serve_html_path;
     bool normal_exit = false;
     bool verbose     = false;
@@ -112,7 +114,14 @@ struct SDSvrParams {
              "--listen-port",
              "server listen port (default: 1234)",
              &listen_port},
-        };
+             {"-H",
+             "--height",
+             "image height (default: 512)",
+             &default_height},
+             {"-W",
+             "--width",
+             "image width (default: 512)",
+             &default_width}};
 
         options.bool_options = {
             {"-v",
@@ -199,6 +208,9 @@ void parse_args(int argc, const char** argv, SDSvrParams& svr_params, SDContextP
     if (random_seed_requested) {
         default_gen_params.seed = -1;
     }
+
+    default_gen_params.width = svr_params.default_width;
+    default_gen_params.height = svr_params.default_height;
 }
 
 std::string extract_and_remove_sd_cpp_extra_args(std::string& text) {
@@ -404,8 +416,8 @@ int main(int argc, const char** argv) {
             std::string size          = j.value("size", "");
             std::string output_format = j.value("output_format", "png");
             int output_compression    = j.value("output_compression", 100);
-            int width                 = 512;
-            int height                = 512;
+            int width                 = default_gen_params.width;
+            int height                = default_gen_params.height;
             if (!size.empty()) {
                 auto pos = size.find('x');
                 if (pos != std::string::npos) {
@@ -784,8 +796,8 @@ int main(int argc, const char** argv) {
 
             std::string prompt          = j.value("prompt", "");
             std::string negative_prompt = j.value("negative_prompt", "");
-            int width                   = j.value("width", 512);
-            int height                  = j.value("height", 512);
+            int width                   = j.value("width", default_gen_params.width);
+            int height                  = j.value("height", default_gen_params.height);
             int steps                   = j.value("steps", -1);
             float cfg_scale             = j.value("cfg_scale", 7.f);
             int64_t seed                = j.value("seed", -1);
