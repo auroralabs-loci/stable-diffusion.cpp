@@ -1,0 +1,89 @@
+name: LOCI Analysis
+on:
+  push:
+    branches:
+      - loci/main-*
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  loci:
+    if: vars.UPSTREAM_REPO != ''
+    runs-on: ubuntu-latest
+
+    env:
+      LOCI_PROJECT: 'stable-diffusion.cpp'
+      LOCI_API_KEY: '${{ secrets.LOCI_API_KEY }}'
+      LOCI_BACKEND_URL: '${{ vars.LOCI_BACKEND_URL }}'
+      GH_TOKEN: ${{ secrets.MIRROR_REPOS_WRITE_PAT }}
+
+    environment: ${{ vars.LOCI_ENV || 'stable-diffusion-cpp-prod' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          ref: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.sha) || github.sha }}
+
+      - name: Compute target
+        id: target
+        if: github.event_name == 'push'
+        run: |
+          branch="${{ github.ref_name }}"
+          sha="${branch#loci/main-}"
+          echo "value=main@${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute base
+        id: base
+        if: github.event_name == 'pull_request'
+        run: |
+          git remote add upstream "https://github.com/${{ vars.UPSTREAM_REPO }}.git" 2>/dev/null || true   
+          git fetch upstream                                                                               
+          upstream_default=$(gh api "repos/${{ vars.UPSTREAM_REPO }}" --jq .default_branch)                
+          merge_base=$(git merge-base HEAD "upstream/${upstream_default}")                                 
+          short_sha="${merge_base:0:7}"                                                                    
+          echo "value=main@${short_sha}" >> "$GITHUB_OUTPUT"                                               
+
+      - name: Install dependencies (including curl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            libcurl4-openssl-dev
+     
+      - name: Create build directory and configure with CMake
+        run: |
+          mkdir build
+          cd build
+          cmake .. \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS_DEBUG="-g -gdwarf-4 -O0 -fno-omit-frame-pointer" \
+            -DCMAKE_C_FLAGS_DEBUG="-g -gdwarf-4 -O0 -fno-omit-frame-pointer" \
+            -DCMAKE_C_FLAGS="-march=armv8-a -Wl,-Bsymbolic" \
+            -DCMAKE_CXX_FLAGS="-march=armv8-a -Wl,-Bsymbolic"
+
+
+      - name: Build project
+        run: |
+          cd build
+          cmake --build . -j4
+
+      - name: Upload build artifacts
+        uses: auroralabs-loci/loci-action@v1
+        with:
+          mode: upload
+          binaries: |
+                build/bin/sd-cli
+                build/bin/sd-server
+          project:  ${{ env.LOCI_PROJECT }}
+          target: ${{ steps.target.outputs.value || ''}}
+          base: ${{ steps.base.outputs.value || '' }}
