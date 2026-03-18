@@ -1467,7 +1467,7 @@ struct SDGenerationParams {
              on_seed_arg},
             {"",
              "--sampling-method",
-             "sampling method, one of [euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m, dpm++2mv2, ipndm, ipndm_v, lcm, ddim_trailing, tcd, res_multistep, res_2s] "
+             "sampling method, one of [euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m, dpm++2mv2, ipndm, ipndm_v, lcm, ddim_trailing, tcd, res_multistep, res_2s, euler_cfg_pp, euler_a_cfg_pp] "
              "(default: euler for Flux/SD3/Wan, euler_a otherwise)",
              on_sample_method_arg},
             {"",

@@ -72,6 +72,8 @@ const char* sampling_methods_str[] = {
     "TCD",
     "Res Multistep",
     "Res 2s",
+    "Euler CFG++",
+    "Euler A CFG++",
 };
 
 /*================================================== Helper Functions ================================================*/
@@ -261,7 +263,12 @@ static void init_cachedit_runtime(SampleCacheRuntime& runtime,
 static void init_spectrum_runtime(SampleCacheRuntime& runtime,
                                   SDVersion version,
                                   const sd_cache_params_t& cache_params,
-                                  const std::vector<float>& sigmas) {
+                                  const std::vector<float>& sigmas,
+                                  sample_method_t method) {
+    if (method == EULER_CFG_PP_SAMPLE_METHOD || method == EULER_A_CFG_PP_SAMPLE_METHOD) {
+        LOG_WARN("Spectrum requested but not supported for CFG++ samplers");
+        return;
+    }
     if (!sd_version_is_unet(version) && !sd_version_is_dit(version)) {
         LOG_WARN("Spectrum requested but not supported for this model type (only UNET and DiT models)");
         return;
@@ -289,7 +296,8 @@ static void init_spectrum_runtime(SampleCacheRuntime& runtime,
 static SampleCacheRuntime init_sample_cache_runtime(SDVersion version,
                                                     const sd_cache_params_t* cache_params,
                                                     Denoiser* denoiser,
-                                                    const std::vector<float>& sigmas) {
+                                                    const std::vector<float>& sigmas,
+                                                    sample_method_t method) {
     SampleCacheRuntime runtime;
     if (cache_params == nullptr || cache_params->mode == SD_CACHE_DISABLED) {
         return runtime;
@@ -315,7 +323,7 @@ static SampleCacheRuntime init_sample_cache_runtime(SDVersion version,
             init_cachedit_runtime(runtime, version, *cache_params, sigmas);
             break;
         case SD_CACHE_SPECTRUM:
-            init_spectrum_runtime(runtime, version, *cache_params, sigmas);
+            init_spectrum_runtime(runtime, version, *cache_params, sigmas, method);
             break;
         default:
             break;
@@ -2035,7 +2043,7 @@ public:
             img_cfg_scale = cfg_scale;
         }
 
-        SampleCacheRuntime cache_runtime = init_sample_cache_runtime(version, cache_params, denoiser.get(), sigmas);
+        SampleCacheRuntime cache_runtime = init_sample_cache_runtime(version, cache_params, denoiser.get(), sigmas, method);
 
         size_t steps   = sigmas.size() - 1;
         ggml_tensor* x = ggml_ext_dup_and_cpy_tensor(work_ctx, init_latent);
@@ -2071,6 +2079,10 @@ public:
             out_img_cond = ggml_dup_tensor(work_ctx, x);
         }
         ggml_tensor* denoised = ggml_dup_tensor(work_ctx, x);
+        ggml_tensor* uncond_denoised = nullptr;
+        if (method == EULER_CFG_PP_SAMPLE_METHOD || method == EULER_A_CFG_PP_SAMPLE_METHOD) {
+            uncond_denoised = ggml_dup_tensor(work_ctx, x);
+        }
 
         int64_t t0 = ggml_time_us();
 
@@ -2099,7 +2111,7 @@ public:
             }
         }
 
-        auto denoise = [&](ggml_tensor* input, float sigma, int step) -> ggml_tensor* {
+        auto denoise = [&](ggml_tensor* input, float sigma, int step, ggml_tensor** uncond_out) -> ggml_tensor* {
             auto sd_preview_cb      = sd_get_preview_callback();
             auto sd_preview_cb_data = sd_get_preview_callback_data();
             auto sd_preview_mode    = sd_get_preview_mode();
@@ -2136,24 +2148,26 @@ public:
             timesteps_vec = process_timesteps(timesteps_vec, init_latent, denoise_mask);
 
             if (cache_runtime.spectrum_enabled && cache_runtime.spectrum.should_predict()) {
-                cache_runtime.spectrum.predict(denoised);
+                if (uncond_out == nullptr) {
+                    cache_runtime.spectrum.predict(denoised);
 
-                if (denoise_mask != nullptr) {
-                    apply_mask(denoised, init_latent, denoise_mask);
-                }
-
-                if (sd_preview_cb != nullptr && sd_should_preview_denoised()) {
-                    if (step % sd_get_preview_interval() == 0) {
-                        preview_image(work_ctx, step, denoised, version, sd_preview_mode, preview_tensor, sd_preview_cb, sd_preview_cb_data, false);
+                    if (denoise_mask != nullptr) {
+                        apply_mask(denoised, init_latent, denoise_mask);
                     }
-                }
 
-                int64_t t1 = ggml_time_us();
-                if (step > 0 || step == -(int)steps) {
-                    int showstep = std::abs(step);
-                    pretty_progress(showstep, (int)steps, (t1 - t0) / 1000000.f / showstep);
+                    if (sd_preview_cb != nullptr && sd_should_preview_denoised()) {
+                        if (step % sd_get_preview_interval() == 0) {
+                            preview_image(work_ctx, step, denoised, version, sd_preview_mode, preview_tensor, sd_preview_cb, sd_preview_cb_data, false);
+                        }
+                    }
+
+                    int64_t t1 = ggml_time_us();
+                    if (step > 0 || step == -(int)steps) {
+                        int showstep = std::abs(step);
+                        pretty_progress(showstep, (int)steps, (t1 - t0) / 1000000.f / showstep);
+                    }
+                    return denoised;
                 }
-                return denoised;
             }
 
             auto timesteps = vector_to_ggml_tensor(work_ctx, timesteps_vec);
@@ -2289,6 +2303,11 @@ public:
             float* positive_data = (float*)out_cond->data;
             int ne_elements      = (int)ggml_nelements(denoised);
 
+            float* vec_uncond_denoised = nullptr;
+            if (uncond_out != nullptr) {
+                vec_uncond_denoised = (float*)uncond_denoised->data;
+            }
+
             if (shifted_timestep > 0 && sd_version_is_sdxl(version)) {
                 int64_t shifted_t_idx              = static_cast<int64_t>(roundf(timesteps_vec[0]));
                 float shifted_sigma                = denoiser->t_to_sigma((float)shifted_t_idx);
@@ -2303,6 +2322,7 @@ public:
 
             for (int i = 0; i < ne_elements; i++) {
                 float latent_result = positive_data[i];
+                float uncond_result = has_unconditioned ? negative_data[i] : positive_data[i];
                 if (has_unconditioned) {
                     // out_uncond + cfg_scale * (out_cond - out_uncond)
                     if (has_img_cond) {
@@ -2322,6 +2342,14 @@ public:
                 // v = latent_result, eps = latent_result
                 // denoised = (v * c_out + input * c_skip) or (input + eps * c_out)
                 vec_denoised[i] = latent_result * c_out + vec_input[i] * c_skip;
+
+                if (vec_uncond_denoised) {
+                    vec_uncond_denoised[i] = uncond_result * c_out + vec_input[i] * c_skip;
+                }
+            }
+
+            if (uncond_out != nullptr) {
+                *uncond_out = uncond_denoised;
             }
 
             if (cache_runtime.spectrum_enabled) {
@@ -2521,6 +2549,8 @@ const char* sample_method_to_str[] = {
     "tcd",
     "res_multistep",
     "res_2s",
+    "euler_cfg_pp",
+    "euler_a_cfg_pp",
 };
 
 const char* sd_sample_method_name(enum sample_method_t sample_method) {

@@ -759,16 +759,21 @@ struct Flux2FlowDenoiser : public FluxFlowDenoiser {
     }
 };
 
-typedef std::function<ggml_tensor*(ggml_tensor*, float, int)> denoise_cb_t;
+typedef std::function<ggml_tensor*(ggml_tensor*, float, int, ggml_tensor**)> denoise_cb_t;
 
 // k diffusion reverse ODE: dx = (x - D(x;\sigma)) / \sigma dt; \sigma(t) = t
 static bool sample_k_diffusion(sample_method_t method,
-                               denoise_cb_t model,
+                               denoise_cb_t raw_model,
                                ggml_context* work_ctx,
                                ggml_tensor* x,
                                std::vector<float> sigmas,
                                std::shared_ptr<RNG> rng,
                                float eta) {
+
+    auto model = [&](ggml_tensor* x, float sigma, int step, ggml_tensor** uncond = nullptr) {
+    return raw_model(x, sigma, step, uncond);
+    };
+
     size_t steps = sigmas.size() - 1;
     // sample_euler_ancestral
     switch (method) {
@@ -1893,6 +1898,102 @@ static bool sample_k_diffusion(sample_method_t method,
 
                     for (int j = 0; j < ggml_nelements(x); j++) {
                         vec_x[j] = vec_x[j] + vec_noise[j] * sigma_up;
+                    }
+                }
+            }
+        } break;
+        case EULER_CFG_PP_SAMPLE_METHOD: // Euler CFG++ sampler from https://cfgpp-diffusion.github.io/
+        {
+            ggml_tensor* d = ggml_dup_tensor(work_ctx, x);
+
+            for (int i = 0; i < steps; i++) {
+                float sigma = sigmas[i];
+                ggml_tensor* uncond_denoised = nullptr;
+
+                // denoise
+                ggml_tensor* denoised = model(x, sigma, i + 1, &uncond_denoised);
+                if (denoised == nullptr || uncond_denoised == nullptr) {
+                    return false;
+                }
+
+                // d = (x - uncond_denoised) / sigma
+                {
+                    float* vec_d      = (float*)d->data;
+                    float* vec_x      = (float*)x->data;
+                    float* vec_uncond = (float*)uncond_denoised->data;
+
+                    for (int j = 0; j < ggml_nelements(d); j++) {
+                        vec_d[j] = (vec_x[j] - vec_uncond[j]) / sigma;
+                    }
+                }
+
+                // Euler method (CFG++)
+                // x = denoised + d * sigmas[i + 1]
+                {
+                    float* vec_d        = (float*)d->data;
+                    float* vec_x        = (float*)x->data;
+                    float* vec_denoised = (float*)denoised->data;
+
+                    for (int j = 0; j < ggml_nelements(x); j++) {
+                        vec_x[j] = vec_denoised[j] + vec_d[j] * sigmas[i + 1];
+                    }
+                }
+            }
+        } break;
+        case EULER_A_CFG_PP_SAMPLE_METHOD: // Euler ancestral CFG++ sampler from https://cfgpp-diffusion.github.io/
+        {
+            ggml_tensor* noise = ggml_dup_tensor(work_ctx, x);
+            ggml_tensor* d     = ggml_dup_tensor(work_ctx, x);
+
+            for (int i = 0; i < steps; i++) {
+                float sigma = sigmas[i];
+                ggml_tensor* uncond_denoised = nullptr;
+
+                // denoise
+                ggml_tensor* denoised = model(x, sigma, i + 1, &uncond_denoised);
+                if (denoised == nullptr || uncond_denoised == nullptr) {
+                    return false;
+                }
+
+                // d = (x - uncond_denoised) / sigma
+                {
+                    float* vec_d      = (float*)d->data;
+                    float* vec_x      = (float*)x->data;
+                    float* vec_uncond = (float*)uncond_denoised->data;
+
+                    for (int j = 0; j < ggml_nelements(d); j++) {
+                        vec_d[j] = (vec_x[j] - vec_uncond[j]) / sigma;
+                    }
+                }
+
+                // get_ancestral_step
+                float sigma_up   = std::min(sigmas[i + 1],
+                                            std::sqrt(sigmas[i + 1] * sigmas[i + 1] * (sigmas[i] * sigmas[i] - sigmas[i + 1] * sigmas[i + 1]) / (sigmas[i] * sigmas[i])));
+                float sigma_down = std::sqrt(sigmas[i + 1] * sigmas[i + 1] - sigma_up * sigma_up);
+
+                // Euler method (CFG++)
+                // x = denoised + d * sigma_down
+                {
+                    float* vec_d        = (float*)d->data;
+                    float* vec_x        = (float*)x->data;
+                    float* vec_denoised = (float*)denoised->data;
+
+                    for (int j = 0; j < ggml_nelements(x); j++) {
+                        vec_x[j] = vec_denoised[j] + vec_d[j] * sigma_down;
+                    }
+                }
+
+                if (sigmas[i + 1] > 0) {
+                    // x = x + noise_sampler(sigmas[i], sigmas[i + 1]) * s_noise * sigma_up
+                    ggml_ext_im_set_randn_f32(noise, rng);
+                    // noise = load_tensor_from_file(work_ctx, "./rand" + std::to_string(i+1) + ".bin");
+                    {
+                        float* vec_x     = (float*)x->data;
+                        float* vec_noise = (float*)noise->data;
+
+                        for (int j = 0; j < ggml_nelements(x); j++) {
+                            vec_x[j] = vec_x[j] + vec_noise[j] * sigma_up;
+                        }
                     }
                 }
             }
