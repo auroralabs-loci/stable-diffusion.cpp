@@ -3450,10 +3450,26 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_g
             denoise_mask = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, width / vae_scale_factor, height / vae_scale_factor, 1, 1);
             for (int ix = 0; ix < denoise_mask->ne[0]; ix++) {
                 for (int iy = 0; iy < denoise_mask->ne[1]; iy++) {
-                    int mx  = ix * vae_scale_factor;
-                    int my  = iy * vae_scale_factor;
-                    float m = ggml_ext_tensor_get_f32(mask_img, mx, my);
-                    ggml_ext_tensor_set_f32(denoise_mask, m, ix, iy);
+                    int mx = ix * vae_scale_factor;
+                    int my = iy * vae_scale_factor;
+
+                    // find the max value in the pixel mask for the current latent pixel
+                    float max_m = ggml_ext_tensor_get_f32(mask_img, mx, my);
+                    for (int kx = 0; kx < vae_scale_factor; kx++) {
+                        for (int ky = 0; ky < vae_scale_factor; ky++) {
+                            int px = mx + kx;
+                            int py = my + ky;
+
+                            if (px < mask_img->ne[0] && py < mask_img->ne[1]) {
+                                float m = ggml_ext_tensor_get_f32(mask_img, px, py);
+                                if (m > max_m) {
+                                    max_m = m;
+                                }
+                            }
+                        }
+                    }
+
+                    ggml_ext_tensor_set_f32(denoise_mask, max_m, ix, iy);
                 }
             }
         }
