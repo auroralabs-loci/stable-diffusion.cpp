@@ -3120,7 +3120,25 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
         }
         cond.c_concat   = concat_latent;
         uncond.c_concat = empty_latent;
-        denoise_mask    = nullptr;
+        // inflate the masked area by taking the max of the surrounding latent pixels, to avoid the edge artifacts
+        auto orig_denoise_mask = ggml_ext_dup_and_cpy_tensor(work_ctx, denoise_mask);
+        for (int ix = 0; ix < denoise_mask->ne[0]; ix++) {
+            for (int iy = 0; iy < denoise_mask->ne[1]; iy++) {
+                float max = ggml_ext_tensor_get_f32(orig_denoise_mask, ix, iy);
+                for (int x = ix - 1; x <= ix + 1; x++) {
+                    for (int y = iy - 1; y <= iy + 1; y++) {
+                        if (x >= 0 && x < denoise_mask->ne[0] && y >= 0 && y < denoise_mask->ne[1]) {
+                            float v = ggml_ext_tensor_get_f32(orig_denoise_mask, x, y);
+                            if (v > max) {
+                                max = v;
+                            }
+                        }
+                    }
+                }
+                ggml_ext_tensor_set_f32(denoise_mask, max, ix, iy);
+            }
+        }
+        // denoise_mask    = nullptr;
     } else if (sd_version_is_unet_edit(sd_ctx->sd->version)) {
         auto empty_latent = ggml_dup_tensor(work_ctx, init_latent);
         ggml_set_f32(empty_latent, 0);
