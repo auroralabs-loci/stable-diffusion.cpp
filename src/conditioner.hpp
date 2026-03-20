@@ -2,8 +2,11 @@
 #define __CONDITIONER_HPP__
 
 #include "clip.hpp"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "llm.hpp"
 #include "t5.hpp"
+#include "util.h"
 
 struct SDCondition {
     ggml_tensor* c_crossattn = nullptr;  // aka context
@@ -32,6 +35,7 @@ struct ConditionerParams {
 };
 
 struct Conditioner {
+    int model_count                                                                        = 1;
     virtual SDCondition get_learned_condition(ggml_context* work_ctx,
                                               int n_threads,
                                               const ConditionerParams& conditioner_params) = 0;
@@ -50,6 +54,11 @@ struct Conditioner {
                                                    const std::string& prompt) {
         GGML_ABORT("Not implemented yet!");
     }
+    virtual bool is_cond_stage_model_name_at_index(const std::string& name, int index) {
+        return true;
+    }
+    virtual ggml_backend_t get_params_backend_at_index(int index) = 0;
+    virtual ggml_backend_t get_runtime_backend_at_index(int index) = 0;
 };
 
 // ldm.modules.encoders.modules.FrozenCLIPEmbedder
@@ -68,7 +77,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
     std::vector<uint8_t> token_embed_custom;
     std::map<std::string, std::pair<int, int>> embedding_pos_map;
 
-    FrozenCLIPEmbedderWithCustomWords(ggml_backend_t backend,
+    FrozenCLIPEmbedderWithCustomWords(std::vector<ggml_backend_t> backends,
                                       bool offload_params_to_cpu,
                                       const String2TensorStorage& tensor_storage_map,
                                       const std::map<std::string, std::string>& orig_embedding_map,
@@ -82,13 +91,28 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             tokenizer.add_special_token(name);
         }
         bool force_clip_f32 = !embedding_map.empty();
+
+        ggml_backend_t clip_backend = backends[0];
+
         if (sd_version_is_sd1(version)) {
-            text_model = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.transformer.text_model", OPENAI_CLIP_VIT_L_14, true, force_clip_f32);
+            LOG_INFO("CLIP-L: using %s backend", ggml_backend_name(clip_backend));
+            text_model = std::make_shared<CLIPTextModelRunner>(clip_backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.transformer.text_model", OPENAI_CLIP_VIT_L_14, true, force_clip_f32);
         } else if (sd_version_is_sd2(version)) {
-            text_model = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.transformer.text_model", OPEN_CLIP_VIT_H_14, true, force_clip_f32);
+            LOG_INFO("CLIP-H: using %s backend", ggml_backend_name(clip_backend));
+            text_model = std::make_shared<CLIPTextModelRunner>(clip_backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.transformer.text_model", OPEN_CLIP_VIT_H_14, true, force_clip_f32);
         } else if (sd_version_is_sdxl(version)) {
-            text_model  = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.transformer.text_model", OPENAI_CLIP_VIT_L_14, false, force_clip_f32);
-            text_model2 = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.1.transformer.text_model", OPEN_CLIP_VIT_BIGG_14, false, force_clip_f32);
+            model_count                   = 2;
+            ggml_backend_t clip_g_backend = clip_backend;
+            if (backends.size() >= 2) {
+                clip_g_backend = backends[1];
+                if (backends.size() > 2) {
+                    LOG_WARN("More than 2 clip backends provided, but the model only supports 2 text encoders. Ignoring the rest.");
+                }
+            }
+            LOG_INFO("CLIP-L: using %s backend", ggml_backend_name(clip_backend));
+            LOG_INFO("CLIP-G: using %s backend", ggml_backend_name(clip_g_backend));
+            text_model  = std::make_shared<CLIPTextModelRunner>(clip_backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.transformer.text_model", OPENAI_CLIP_VIT_L_14, false, force_clip_f32);
+            text_model2 = std::make_shared<CLIPTextModelRunner>(clip_g_backend, offload_params_to_cpu, tensor_storage_map, "cond_stage_model.1.transformer.text_model", OPEN_CLIP_VIT_BIGG_14, false, force_clip_f32);
         }
     }
 
@@ -648,6 +672,42 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                                             conditioner_params.adm_in_channels,
                                             conditioner_params.zero_out_masked);
     }
+
+    bool is_cond_stage_model_name_at_index(const std::string& name, int index) override {
+        if (sd_version_is_sdxl(version)) {
+            if (index == 0) {
+                return contains(name, "cond_stage_model.model.transformer");
+            } else if (index == 1) {
+                return contains(name, "cond_stage_model.model.1");
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    ggml_backend_t get_params_backend_at_index(int index){
+        if (sd_version_is_sdxl(version) && index == 1){
+            if(text_model2) {
+                return text_model2->get_params_backend();
+            }
+        } else if (text_model) {
+            return text_model->get_params_backend();
+        }
+        return nullptr;
+    }
+
+    ggml_backend_t get_runtime_backend_at_index(int index){
+        if (sd_version_is_sdxl(version) && index == 1){
+            if(text_model2) {
+                return text_model2->get_runtime_backend();
+            }
+        } else if (text_model) {
+            return text_model->get_runtime_backend();
+        }
+        return nullptr;
+    }
+
 };
 
 struct FrozenCLIPVisionEmbedder : public GGMLRunner {
@@ -715,13 +775,31 @@ struct SD3CLIPEmbedder : public Conditioner {
     std::shared_ptr<CLIPTextModelRunner> clip_g;
     std::shared_ptr<T5Runner> t5;
 
-    SD3CLIPEmbedder(ggml_backend_t backend,
+    SD3CLIPEmbedder(std::vector<ggml_backend_t> backends,
                     bool offload_params_to_cpu,
                     const String2TensorStorage& tensor_storage_map = {})
         : clip_g_tokenizer(0) {
         bool use_clip_l = false;
         bool use_clip_g = false;
         bool use_t5     = false;
+
+        model_count = 3;
+
+        ggml_backend_t clip_l_backend, clip_g_backend, t5_backend;
+        if (backends.size() == 1) {
+            clip_l_backend = clip_g_backend = t5_backend = backends[0];
+        } else if (backends.size() == 2) {
+            clip_l_backend = clip_g_backend = backends[0];
+            t5_backend                      = backends[1];
+        } else if (backends.size() >= 3) {
+            clip_l_backend = backends[0];
+            clip_g_backend = backends[1];
+            t5_backend     = backends[2];
+            if (backends.size() > 3) {
+                LOG_WARN("More than 3 clip backends provided, but the model only supports 3 text encoders. Ignoring the rest.");
+            }
+        }
+
         for (auto pair : tensor_storage_map) {
             if (pair.first.find("text_encoders.clip_l") != std::string::npos) {
                 use_clip_l = true;
@@ -736,13 +814,16 @@ struct SD3CLIPEmbedder : public Conditioner {
             return;
         }
         if (use_clip_l) {
-            clip_l = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_storage_map, "text_encoders.clip_l.transformer.text_model", OPENAI_CLIP_VIT_L_14, false);
+            LOG_INFO("CLIP-L: using %s backend", ggml_backend_name(clip_l_backend));
+            clip_l = std::make_shared<CLIPTextModelRunner>(clip_l_backend, offload_params_to_cpu, tensor_storage_map, "text_encoders.clip_l.transformer.text_model", OPENAI_CLIP_VIT_L_14, false);
         }
         if (use_clip_g) {
-            clip_g = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_storage_map, "text_encoders.clip_g.transformer.text_model", OPEN_CLIP_VIT_BIGG_14, false);
+            LOG_INFO("CLIP-G: using %s backend", ggml_backend_name(clip_g_backend));
+            clip_g = std::make_shared<CLIPTextModelRunner>(clip_g_backend, offload_params_to_cpu, tensor_storage_map, "text_encoders.clip_g.transformer.text_model", OPEN_CLIP_VIT_BIGG_14, false);
         }
         if (use_t5) {
-            t5 = std::make_shared<T5Runner>(backend, offload_params_to_cpu, tensor_storage_map, "text_encoders.t5xxl.transformer");
+            LOG_INFO("T5-XXL: using %s backend", ggml_backend_name(t5_backend));
+            t5 = std::make_shared<T5Runner>(t5_backend, offload_params_to_cpu, tensor_storage_map, "text_encoders.t5xxl.transformer");
         }
     }
 
@@ -1139,6 +1220,42 @@ struct SD3CLIPEmbedder : public Conditioner {
                                             conditioner_params.clip_skip,
                                             conditioner_params.zero_out_masked);
     }
+
+    bool is_cond_stage_model_name_at_index(const std::string& name, int index) override {
+        if (index == 0) {
+            return contains(name, "text_encoders.clip_l");
+        } else if (index == 1) {
+            return contains(name, "text_encoders.clip_g");
+        } else if (index == 2) {
+            return contains(name, "text_encoders.t5xxl");
+        } else {
+            return false;
+        }
+    }
+
+    ggml_backend_t get_params_backend_at_index(int index){
+        if (index == 0 && clip_l) {
+            return clip_l->get_params_backend();
+        } else if (index == 1 && clip_g) {
+            return clip_g->get_params_backend();
+        } else if (index == 2 && t5) {
+            return t5->get_params_backend();
+        } else {
+            return nullptr;
+        }
+    }
+
+    ggml_backend_t get_runtime_backend_at_index(int index){
+        if (index == 0 && clip_l) {
+            return clip_l->get_runtime_backend();
+        } else if (index == 1 && clip_g) {
+            return clip_g->get_runtime_backend();
+        } else if (index == 2 && t5) {
+            return t5->get_runtime_backend();
+        } else {
+            return nullptr;
+        }
+    }
 };
 
 struct FluxCLIPEmbedder : public Conditioner {
@@ -1148,11 +1265,25 @@ struct FluxCLIPEmbedder : public Conditioner {
     std::shared_ptr<T5Runner> t5;
     size_t chunk_len = 256;
 
-    FluxCLIPEmbedder(ggml_backend_t backend,
+    FluxCLIPEmbedder(std::vector<ggml_backend_t> backends,
                      bool offload_params_to_cpu,
                      const String2TensorStorage& tensor_storage_map = {}) {
         bool use_clip_l = false;
         bool use_t5     = false;
+
+        model_count = 2;
+
+        ggml_backend_t clip_l_backend, t5_backend;
+        if (backends.size() == 1) {
+            clip_l_backend = t5_backend = backends[0];
+        } else if (backends.size() >= 2) {
+            clip_l_backend = backends[0];
+            t5_backend     = backends[1];
+            if (backends.size() > 2) {
+                LOG_WARN("More than 2 clip backends provided, but the model only supports 2 text encoders. Ignoring the rest.");
+            }
+        }
+
         for (auto pair : tensor_storage_map) {
             if (pair.first.find("text_encoders.clip_l") != std::string::npos) {
                 use_clip_l = true;
@@ -1167,12 +1298,14 @@ struct FluxCLIPEmbedder : public Conditioner {
         }
 
         if (use_clip_l) {
-            clip_l = std::make_shared<CLIPTextModelRunner>(backend, offload_params_to_cpu, tensor_storage_map, "text_encoders.clip_l.transformer.text_model", OPENAI_CLIP_VIT_L_14, true);
+            LOG_INFO("CLIP-L: using %s backend", ggml_backend_name(clip_l_backend));
+            clip_l = std::make_shared<CLIPTextModelRunner>(clip_l_backend, offload_params_to_cpu, tensor_storage_map, "text_encoders.clip_l.transformer.text_model", OPENAI_CLIP_VIT_L_14, true);
         } else {
             LOG_WARN("clip_l text encoder not found! Prompt adherence might be degraded.");
         }
         if (use_t5) {
-            t5 = std::make_shared<T5Runner>(backend, offload_params_to_cpu, tensor_storage_map, "text_encoders.t5xxl.transformer");
+            LOG_INFO("T5-XXL: using %s backend", ggml_backend_name(clip_l_backend));
+            t5 = std::make_shared<T5Runner>(t5_backend, offload_params_to_cpu, tensor_storage_map, "text_encoders.t5xxl.transformer");
         } else {
             LOG_WARN("t5xxl text encoder not found! Prompt adherence might be degraded.");
         }
@@ -1416,6 +1549,36 @@ struct FluxCLIPEmbedder : public Conditioner {
                                             conditioner_params.clip_skip,
                                             conditioner_params.zero_out_masked);
     }
+
+    bool is_cond_stage_model_name_at_index(const std::string& name, int index) override {
+        if (index == 0) {
+            return contains(name, "text_encoders.clip_l");
+        } else if (index == 1) {
+            return contains(name, "text_encoders.t5xxl");
+        } else {
+            return false;
+        }
+    }
+
+    ggml_backend_t get_params_backend_at_index(int index){
+        if (index == 0 && clip_l) {
+            return clip_l->get_params_backend();
+        } else if (index == 1 && t5) {
+            return t5->get_params_backend();
+        } else {
+            return nullptr;
+        }
+    }
+
+    ggml_backend_t get_runtime_backend_at_index(int index){
+        if (index == 0 && clip_l) {
+            return clip_l->get_runtime_backend();
+        } else if (index == 1 && t5) {
+            return t5->get_runtime_backend();
+        } else {
+            return nullptr;
+        }
+    }
 };
 
 struct T5CLIPEmbedder : public Conditioner {
@@ -1639,6 +1802,20 @@ struct T5CLIPEmbedder : public Conditioner {
                                             conditioner_params.clip_skip,
                                             conditioner_params.zero_out_masked);
     }
+
+    ggml_backend_t get_params_backend_at_index(int index){
+        if (t5){
+            return t5->get_params_backend();
+        }
+        return nullptr;
+    }
+
+    ggml_backend_t get_runtime_backend_at_index(int index){
+        if (t5){
+            return t5->get_runtime_backend();
+        }
+        return nullptr;
+    }
 };
 
 struct AnimaConditioner : public Conditioner {
@@ -1651,11 +1828,11 @@ struct AnimaConditioner : public Conditioner {
                      const String2TensorStorage& tensor_storage_map = {}) {
         qwen_tokenizer = std::make_shared<LLM::Qwen2Tokenizer>();
         llm            = std::make_shared<LLM::LLMRunner>(LLM::LLMArch::QWEN3,
-                                               backend,
-                                               offload_params_to_cpu,
-                                               tensor_storage_map,
-                                               "text_encoders.llm",
-                                               false);
+                                                          backend,
+                                                          offload_params_to_cpu,
+                                                          tensor_storage_map,
+                                                          "text_encoders.llm",
+                                                          false);
     }
 
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
@@ -1774,6 +1951,20 @@ struct AnimaConditioner : public Conditioner {
         LOG_DEBUG("computing condition graph completed, taking %" PRId64 " ms", t1 - t0);
 
         return {hidden_states, t5_weight_tensor, t5_ids_tensor};
+    }
+
+    ggml_backend_t get_params_backend_at_index(int index){
+        if (llm){
+            return llm->get_params_backend();
+        }
+        return nullptr;
+    }
+
+    ggml_backend_t get_runtime_backend_at_index(int index){
+        if (llm){
+            return llm->get_runtime_backend();
+        }
+        return nullptr;
     }
 };
 
@@ -2148,6 +2339,20 @@ struct LLMEmbedder : public Conditioner {
         int64_t t1 = ggml_time_ms();
         LOG_DEBUG("computing condition graph completed, taking %" PRId64 " ms", t1 - t0);
         return {hidden_states, nullptr, nullptr, extra_hidden_states_vec};
+    }
+
+    ggml_backend_t get_params_backend_at_index(int index){
+        if (llm){
+            return llm->get_params_backend();
+        }
+        return nullptr;
+    }
+
+    ggml_backend_t get_runtime_backend_at_index(int index){
+        if (llm){
+            return llm->get_runtime_backend();
+        }
+        return nullptr;
     }
 };
 
