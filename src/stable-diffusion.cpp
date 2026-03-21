@@ -481,6 +481,7 @@ static void log_sample_cache_summary(const SampleCacheRuntime& runtime, size_t t
 class StableDiffusionGGML {
 public:
     ggml_backend_t backend             = nullptr;  // general backend
+    ggml_backend_t cpu_backend         = nullptr;
     ggml_backend_t clip_backend        = nullptr;
     ggml_backend_t control_net_backend = nullptr;
     ggml_backend_t vae_backend         = nullptr;
@@ -531,14 +532,8 @@ public:
     StableDiffusionGGML() = default;
 
     ~StableDiffusionGGML() {
-        if (clip_backend != backend) {
-            ggml_backend_free(clip_backend);
-        }
-        if (control_net_backend != backend) {
-            ggml_backend_free(control_net_backend);
-        }
-        if (vae_backend != backend) {
-            ggml_backend_free(vae_backend);
+        if (cpu_backend != backend) {
+            ggml_backend_free(cpu_backend);
         }
         ggml_backend_free(backend);
     }
@@ -596,8 +591,16 @@ public:
 
         if (!backend) {
             LOG_DEBUG("Using CPU backend");
-            backend = ggml_backend_cpu_init();
+            cpu_backend = ggml_backend_cpu_init();
+            backend     = cpu_backend;
         }
+    }
+
+    ggml_backend_t get_cpu_backend() {
+        if (cpu_backend == nullptr) {
+            cpu_backend = ggml_backend_cpu_init();
+        }
+        return cpu_backend;
     }
 
     std::shared_ptr<RNG> get_rng(rng_type_t rng_type) {
@@ -804,7 +807,7 @@ public:
             clip_backend = backend;
             if (clip_on_cpu && !ggml_backend_is_cpu(backend)) {
                 LOG_INFO("CLIP: Using CPU backend");
-                clip_backend = ggml_backend_cpu_init();
+                clip_backend = get_cpu_backend();
             }
             if (sd_version_is_sd3(version)) {
                 cond_stage_model = std::make_shared<SD3CLIPEmbedder>(clip_backend,
@@ -973,7 +976,7 @@ public:
 
             if (sd_ctx_params->keep_vae_on_cpu && !ggml_backend_is_cpu(backend)) {
                 LOG_INFO("VAE Autoencoder: Using CPU backend");
-                vae_backend = ggml_backend_cpu_init();
+                vae_backend = get_cpu_backend();
             } else {
                 vae_backend = backend;
             }
@@ -1066,7 +1069,7 @@ public:
                 ggml_backend_t controlnet_backend = nullptr;
                 if (sd_ctx_params->keep_control_net_on_cpu && !ggml_backend_is_cpu(backend)) {
                     LOG_DEBUG("ControlNet: Using CPU backend");
-                    controlnet_backend = ggml_backend_cpu_init();
+                    controlnet_backend = get_cpu_backend();
                 } else {
                     controlnet_backend = backend;
                 }
@@ -2441,7 +2444,7 @@ public:
     ggml_tensor* encode_first_stage(ggml_context* work_ctx, ggml_tensor* x) {
         ggml_tensor* latents = encode_to_vae_latents(work_ctx, x);
         if (version != VERSION_SD1_PIX2PIX) {
-            latents = first_stage_model->vae_to_diffuison_latents(work_ctx, latents);
+            latents = first_stage_model->vae_to_diffusion_latents(work_ctx, latents);
         }
         return latents;
     }
@@ -3780,7 +3783,7 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
             }
         });
 
-        init_latent = sd_ctx->sd->first_stage_model->vae_to_diffuison_latents(work_ctx, init_latent);
+        init_latent = sd_ctx->sd->first_stage_model->vae_to_diffusion_latents(work_ctx, init_latent);
 
         int64_t t2 = ggml_time_ms();
         LOG_INFO("encode_first_stage completed, taking %" PRId64 " ms", t2 - t1);
