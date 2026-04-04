@@ -15,6 +15,9 @@ if(SD_WEBP)
     set(WEBP_BUILD_WEBP_JS OFF)
     set(WEBP_BUILD_FUZZTEST OFF)
     set(WEBP_BUILD_LIBWEBPMUX ON)
-
     add_subdirectory(libwebp EXCLUDE_FROM_ALL)
+endif()
+
+if (BUILD_SHARED_LIBS)
+    set_target_properties(${Z_TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
